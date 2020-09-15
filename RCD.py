@@ -18,8 +18,8 @@ def print_tableau(data, p):
 ## argparse to get filename from command line
 parser = argparse.ArgumentParser(description='Perform RCD on some dataset.')
 parser.add_argument('data', type=str, nargs='?', help='name of the data (.csv)')
+parser.add_argument('bias', type=bool, default=False, nargs='?', help='use markedness over faithfulness bias?')
 args = parser.parse_args()
-
 FILENAME = args.data
 
 ## Load file from FILENAME
@@ -37,67 +37,118 @@ print_tableau(data, p)
 ## ============================================================
 ##                  Computing W and L
 ## ============================================================
-data = np.array(data)
-iteration = 1
 
 ## some information we need
+data = np.array(data)
 CONSTRAINTS = data[0][2:]
 ORDER = []
+iteration = 1
 
 def RCD(data=data, ORDER=ORDER, CONSTRAINTS=CONSTRAINTS, iteration=iteration):
-    ## simplify list to contain only the candidates and violations
-    df = np.array([r for r in data if not re.search('/', r[0])])
+    ## record the indices of the rows containing URs: /UR/
+    UR_idx = np.argwhere([re.search('/', r[0]) for r in data])
+    if UR_idx.ndim > 1: UR_idx = UR_idx.squeeze(-1)
 
-    ## go down the rows and compare it to the row of the winning candidate
-    t = np.array([[len(re.findall(r'\*', cell)) for cell in r] for r in df])
+    ## convert matrix to correspond to the number of * in each cell of the matrix
+    t = np.array([[len(re.findall(r'\*', cell)) for cell in r] for r in data])
 
     ## generate a vector denoting where the winners are
-    w_idx = np.squeeze(np.argwhere(df[:,1] == '1'))
+    w_idx = np.argwhere(data[:,1] == '1')
+    if w_idx.ndim > 1: w_idx = w_idx.squeeze(-1)
 
-    # generate winners
-    if t[w_idx].ndim < 2: winners = np.max(np.reshape(t[w_idx], (1,-1))[:,2:], 0)
-    else: winners = np.max(t[w_idx][:,2:], 0)
+    ## compile a matrix of winner violations over all tableaux
+    n_winners = len(w_idx)
+    if t[w_idx].ndim < 2: winner_violations = np.reshape(t[w_idx], (1,-1))[:,2:]
+    else: winner_violations = t[w_idx][:,2:]
 
-    # generate losers
-    losers = np.array(np.delete(t, w_idx, axis=0)[:,2:])
-
-    ## if there are no more losers, break
-    if len(losers) == 0: ORDER.append(data[0,2:]); return
-
-    ## otherwise, proceed as normal
-    losers = np.max(losers, axis=0)
+    ## compile a matrix of loser violations for each tableau
+    loser_violations = []
+    for i in range(0, len(UR_idx)):
+        if i == len(UR_idx)-1: prev, nxt = UR_idx[i], t.shape[0]
+        else:                  prev, nxt = UR_idx[i], UR_idx[i+1]
+        loser_violations.append(np.delete(t, w_idx[i], 0)[prev:nxt-1][1:,2:])
 
     ## generate the comparative tableau
-    ## positive numbers are winner-preferred; non-positive is loser-preferred
-    t = losers - winners
+    ## positive numbers are winner-preferred; negative is loser-preferred
+    comparative_tableau = [loser_violations[i] - winner_violations[i] for i in range(n_winners)]
 
-    ## sum over the columns and see which ones are positive; if so, then it is a loser-preferring constraint
-    loser_constraints = np.argwhere(t > 0).squeeze(-1)
+    ## see which columns contain only positive or 0 violations
+    wp = [np.argwhere(c > 0).squeeze(-1) for ct in comparative_tableau for c in ct]
+    wp, n_wp = np.unique(np.hstack(wp), return_counts = True)
+    even = [np.argwhere(c >= 0).squeeze(-1) for ct in comparative_tableau for c in ct]
+    even, n_even = np.unique(np.hstack(even), return_counts = True)
 
-    ## if the length of loser_constraints is 0, and the code did not end earlier, then we have an ambiguous ranking; throw an error
-    if len(loser_constraints) == 0:
+    ## pick out the constraints that are at least uninformative (even)
+    pwp = np.argwhere(n_even == np.vstack(loser_violations).shape[0])
+
+    ## if that constraint has at least one actual violation mark, then it is
+    ## a winner-preferring constraint
+    if len(pwp) >= 0:
+        wp = [even[c] for c in pwp if even[wp] in wp]
+    if len(wp) == 0:
         raise ValueError("Unable to find any loser-preferring constraints; is there more than one winner?")
-    ORDER.append(data[0,loser_constraints+2])
+
+    ## fix dimensions
+    if len(wp) > 1: wp = np.unique(np.hstack(wp))
+    else: wp = np.array(wp).squeeze(-1)
+
+    ## for the constraints, check to see which ones are markedness constraints and which are faithfulness
+    ## if bias == True, then rank within that stratum all the markedness constraints above the faithfulness ones
+    ranked_constraints = data[0,wp+2]
+    if args.bias == True:
+        M = [c for c in ranked_constraints if re.search(r'\*', c)]
+        F = [c for c in ranked_constraints if c not in M]
+        print("M >> F active: ranking {} above {}".format(', '.join(M), ', '.join(F)))
+        if len(M) > 0: ORDER.append(M)
+        if len(F) > 0: ORDER.append(F)
+    else: ORDER.append(data[0,wp+2])
 
     ## for these indices, see which candidates are explained and remove them
     # record the indices of the candidates with violations of the loser constraints
-    contains_violation = np.array([ [bool(re.search(r'\*$', cell)) for cell in r] for r in data[:,loser_constraints+2] ])
+    contains_violation = np.array([ [bool(re.search(r'\*$', cell)) for cell in r] for r in data[:,wp+2] ])
     explained_candidates = np.argwhere(np.sum(contains_violation, axis=1)).squeeze() # recall that we removed the first two columns
     new_data = np.delete(data, explained_candidates, axis=0)
-    new_data = np.delete(new_data, loser_constraints+2, axis=1)
-    print('Constraints that are winner-preferring: {}'.format(', '.join(data[0,loser_constraints+2])))
-    print('Candidates that are explained: {}'.format(', '.join(data[explained_candidates,0])))
+    new_data = np.delete(new_data, wp+2, axis=1)
+    print('Constraints that are winner-preferring: {}'.format(', '.join(data[0,wp+2])))
+    print('Candidates that are explained: {}\n'.format(', '.join(data[explained_candidates,0])))
+    CONSTRAINTS = new_data[0,2:]
 
     ## also remove winners that no longer have any competitors
     satisfied = []
-    candidates = new_data[1:,0]
-    for i in range(len(candidates)):
+    candidates = new_data[:,0]
+    for i in range(1,len(candidates)):
         if i == len(candidates)-1:
-            if re.search(r'/', candidates[i-1]): satisfied += [i, i+1]
+            if re.search(r'/', candidates[i-1]): satisfied += [i-1, i]
         else:
-            if re.search(r'/', candidates[i-1]) and re.search(r'/', candidates[i+1]): satisfied += [i, i+1]
+            if re.search(r'/', candidates[i-1]) and re.search(r'/', candidates[i+1]): satisfied += [i-1, i]
     satisfied = np.array(satisfied)
     new_data = np.delete(new_data, satisfied, axis=0)
+
+    ## check if the matrix is empty; if so, learning is done
+    if len(new_data) == 0:
+        p = 'Learning complete; no more competitors'
+        fill = '=' * (len(p) + 5)
+        print(fill, p, fill, sep='\n')
+        print()
+        ranked_constraints = CONSTRAINTS
+        if args.bias == True:
+            M = [c for c in ranked_constraints if re.search(r'\*', c)]
+            F = [c for c in ranked_constraints if c not in M]
+            print("The remaining constraints are not rankable: {}".format(', '.join(ranked_constraints)))
+            if len(M) > 0 and len(F) > 0:
+                ORDER.append(M)
+                ORDER.append(F)
+                print("M >> F active: ranking {} above {}\n".format(', '.join(M), ', '.join(F)))
+            elif len(F) > 0:
+                ORDER.append(F)
+                print("M >> F active: {}\n".format(', '.join(F)))
+            elif len(M) > 0:
+                ORDER.append(M)
+                print("M >> F active: {}\n".format(', '.join(M)))
+            else:
+                print("No more constraints to rank")
+        else: ORDER.append(CONSTRAINTS)
+    return
 
     ## formatting data for printing
     p = 'Tableau at iteration {}'.format(iteration)
